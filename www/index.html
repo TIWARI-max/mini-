@@ -610,20 +610,99 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
-/* MYChat native bridge: real Android notifications when running inside the APK (Capacitor). */
+/* MYChat native bridge: Android notifications via OneSignal push (works when the app is closed). */
 (function(){
   var cap = window.Capacitor;
   var isNative = !!(cap && cap.isNativePlatform && cap.isNativePlatform());
-  window.MYChatNative = { isNative: isNative, requestPermission: function(){ return Promise.resolve(false); }, notify: function(){} };
+  var OS_APP_ID = '__ONESIGNAL_APP_ID__';
+  var OS_KEY = '__ONESIGNAL_REST_KEY__';
+  var pushConfigured = OS_APP_ID.length > 10 && OS_KEY.length > 10 && OS_APP_ID.indexOf('__') !== 0 && OS_KEY.indexOf('__') !== 0;
+  window.MYChatNative = {
+    isNative: isNative,
+    requestPermission: function(){ return Promise.resolve(false); },
+    notify: function(){},
+    setRoom: function(){},
+    leaveRoom: function(){},
+    wrapRef: function(ref){ return ref; }
+  };
   if(!isNative) return;
   document.documentElement.classList.add('native-app');
   var st = document.createElement('style');
   st.textContent = '#pwaInstallBtn,#pushEnableBtn,#loginPwaHint{display:none !important;}';
   document.head.appendChild(st);
+
+  /* ---------- OneSignal push (app closed) ---------- */
+  var osReady = false, pendingTags = null;
+  function getOS(){ return window.plugins && window.plugins.OneSignal; }
+  function applyTags(){
+    var OS = getOS();
+    if(!osReady || !OS || !pendingTags) return;
+    try{ OS.User.addTags(pendingTags); }catch(e){ console.warn('tag error', e); }
+  }
+  function initOS(tries){
+    var OS = getOS();
+    if(!OS){ if(tries < 40) setTimeout(function(){ initOS(tries + 1); }, 500); return; }
+    try{
+      OS.initialize(OS_APP_ID);
+      try{ OS.Notifications.addEventListener('foregroundWillDisplay', function(ev){ try{ ev.preventDefault(); }catch(_){} }); }catch(_){}
+      try{ OS.Notifications.requestPermission(true); }catch(_){}
+      osReady = true;
+      applyTags();
+    }catch(e){ console.warn('OneSignal init error', e); }
+  }
+  if(pushConfigured) document.addEventListener('DOMContentLoaded', function(){ initOS(0); });
+
+  function bodyOf(m){
+    return m.type === 'audio' ? '🎙️ Voice message' : m.type === 'image' ? '🖼️ Image' : m.type === 'file' ? '📎 ' + (m.fileName || 'Attachment') : String(m.text || 'New message').slice(0, 160);
+  }
+  function sendPush(m, ctx){
+    if(!pushConfigured || !ctx || !ctx.room) return;
+    try{
+      fetch('https://api.onesignal.com/notifications', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'Authorization': 'Key ' + OS_KEY},
+        body: JSON.stringify({
+          app_id: OS_APP_ID,
+          target_channel: 'push',
+          filters: [
+            {field: 'tag', key: 'room', relation: '=', value: ctx.room},
+            {operator: 'AND'},
+            {field: 'tag', key: 'user', relation: '!=', value: ctx.user}
+          ],
+          headings: {en: (ctx.user || 'New message') + ' • MYChat'},
+          contents: {en: bodyOf(m)},
+          android_group: 'mychat-' + ctx.room
+        })
+      }).catch(function(e){ console.warn('push send failed', e); });
+    }catch(e){ console.warn('push send error', e); }
+  }
+  window.MYChatNative.wrapRef = function(ref, getCtx){
+    try{
+      if(ref.__mychatWrapped) return ref;
+      var orig = ref.push.bind(ref);
+      ref.push = function(v){
+        try{ var c = getCtx(); if(v && !v.sys && v.user && c && v.user === c.user) sendPush(v, c); }catch(e){}
+        return orig.apply(null, arguments);
+      };
+      ref.__mychatWrapped = true;
+    }catch(e){}
+    return ref;
+  };
+  window.MYChatNative.setRoom = function(room, user){
+    pendingTags = {room: String(room), user: String(user)};
+    applyTags();
+  };
+  window.MYChatNative.leaveRoom = function(){
+    pendingTags = null;
+    var OS = getOS();
+    try{ if(osReady && OS) OS.User.removeTags(['room', 'user']); }catch(e){}
+  };
+
+  /* ---------- Local notification fallback (used only if push is not configured) ---------- */
   var LN = (cap.Plugins && cap.Plugins.LocalNotifications) || (cap.registerPlugin && cap.registerPlugin('LocalNotifications'));
-  if(!LN) return;
   var granted = false, nextId = 1;
   async function requestPermission(){
+    if(!LN) return false;
     try{
       var cur = await LN.checkPermissions();
       if(cur.display !== 'granted') cur = await LN.requestPermissions();
@@ -636,7 +715,7 @@
   }
   window.MYChatNative.requestPermission = requestPermission;
   window.MYChatNative.notify = function(title, body, room){
-    if(!granted) return;
+    if(pushConfigured || !LN || !granted) return;
     try{
       LN.schedule({ notifications: [{ id: (nextId++ % 2000000000), title: title, body: body, channelId: 'messages', extra: {room: room} }] });
     }catch(e){ console.warn('notify error', e); }
@@ -939,7 +1018,7 @@
         settingsRef.set({ admin: username });
       }
 
-      messagesRef = db.ref('rooms/' + safeRoom + '/messages');
+      messagesRef = window.MYChatNative.wrapRef(db.ref('rooms/' + safeRoom + '/messages'), function(){ return {user: username, room: safeRoom}; });
       membersRef = db.ref('rooms/' + safeRoom + '/members');
       myMemberRef = db.ref('rooms/' + safeRoom + '/members/' + safeId(username));
 
@@ -1034,7 +1113,7 @@
     roomLabel2.textContent = rName;
     updateHeaderAvatar(rName);
     
-    messagesRef = db.ref('rooms/' + safeRoom + '/messages');
+    messagesRef = window.MYChatNative.wrapRef(db.ref('rooms/' + safeRoom + '/messages'), function(){ return {user: username, room: safeRoom}; });
     
     clearChatDOM();
     emptyMsg.style.display = 'block';
@@ -1210,7 +1289,7 @@
     try {
       localStorage.setItem('mychat_username', username);
       localStorage.setItem('mychat_room', roomKey);
-      if (window.MYChatNative && window.MYChatNative.isNative) { window.MYChatNative.requestPermission(); }
+      if (window.MYChatNative && window.MYChatNative.isNative) { window.MYChatNative.requestPermission(); window.MYChatNative.setRoom(safeRoom, username); }
       if (window.MYChatPush && 'Notification' in window && Notification.permission === 'granted') {
         window.MYChatPush.enable().catch(()=>{});
       }
@@ -1823,6 +1902,7 @@
   $('menuToggle').addEventListener('click', () => { sidebar.classList.toggle('open'); scrim.classList.toggle('open'); });
   
   function leaveRoom(isNuked = false){
+    try{ window.MYChatNative.leaveRoom(); }catch(_){}
     if (safeRoom) localStorage.setItem('lastSeen_' + safeRoom, Date.now());
     
     if (!isSuperAdmin && !isNuked && isOnline) {
