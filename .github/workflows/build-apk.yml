@@ -32,6 +32,13 @@ jobs:
           sed -i '/<application/i \    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.VIBRATE" />' $M
           cat $M
 
+      - name: Insert OneSignal keys
+        env:
+          OS_APP_ID: ${{ secrets.ONESIGNAL_APP_ID }}
+          OS_REST_KEY: ${{ secrets.ONESIGNAL_REST_KEY }}
+        run: |
+          sed -i "s|__ONESIGNAL_APP_ID__|$OS_APP_ID|g; s|__ONESIGNAL_REST_KEY__|$OS_REST_KEY|g" www/index.html
+
       - name: Sync web files
         run: npx cap sync android
 
